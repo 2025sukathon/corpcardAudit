@@ -1,0 +1,21 @@
+# venv / caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# local data
+.env
+*.db
+data/vectorstore/
+data/*.csv
+data/*.xlsx
+
+# build artifacts
+dist/
+build/

@@ -1,0 +1,10 @@
+# 텍스트 파일은 기본적으로 LF 정규화
+* text=auto
+
+# 이미지/바이너리
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.xls binary
+*.xlsx binary
