@@ -1,21 +1,28 @@
-# venv / caches
+# Python venv
 .venv/
+.venv312/
 venv/
+ENV/
+env/
+
+# Byte-compiled / cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-# OS / IDE
-.DS_Store
-.idea/
+# VSCode / PyCharm settings
 .vscode/
+.idea/
 
-# local data
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
 .env
-*.db
-data/vectorstore/
-data/*.csv
-data/*.xlsx
+.env.*
 
-# build artifacts
-dist/
+# Build outputs
 build/
+dist/
+*.egg-info/
