@@ -5,6 +5,13 @@ venv/
 ENV/
 env/
 
+# local test data
+data/samples/
+data/vectorstore/
+
+# local python envs
+.venv*/
+
 # Byte-compiled / cache
 __pycache__/
 *.py[cod]
@@ -26,3 +33,4 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+requirements-py313.txt
