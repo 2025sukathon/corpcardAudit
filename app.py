@@ -3,6 +3,7 @@ import os, sys
 import time
 import streamlit as st
 import pandas as pd
+from services.autofill.autofill_service import process_html
 from utils.io_schemas import CARD_COLS, MANUAL_COLS, TRAVEL_TITLES_COLS
 from utils.settings import NAVER_CLIENT_ID
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
@@ -11,97 +12,147 @@ from services.rag import build_index, rag_answer
 from services.auto_fill import auto_fill_card_rows, auto_defaults_for_non_corp, auto_title
 from services.travel_report_check import mark_missing_reports
 from services.naver_maps import geocode, static_map, route_summary
+from services.autofill.ocr_attendance import extract_times_from_image
+from services.autofill.autofill_service import process_html
+
 
 
 st.set_page_config(page_title="출장비용 자동기입/검증", layout="wide")
 
-if "applicant_name" not in st.session_state:
-    st.session_state.applicant_name = None
+# [S] 초기 사용자이름 입력 페이지===========
+# if "applicant_name" not in st.session_state:
+#     st.session_state.applicant_name = None
 
-if not st.session_state.applicant_name:
-    st.title("🔐 로그인 / 사용자 등록")
-    name_in = st.text_input("신청자 이름을 입력하세요 (예: 김도희)")
-    if st.button("확인", key="login_confirm"):
-        if name_in.strip():
-            st.session_state.applicant_name = name_in.strip()
-            st.success(f"안녕하세요, {st.session_state.applicant_name}님! 👋")
-            st.rerun()
-        else:
-            st.warning("이름을 입력하세요.")
-    st.stop()
+# if not st.session_state.applicant_name:
+#     st.title("🔐 로그인 / 사용자 등록")
+#     name_in = st.text_input("신청자 이름을 입력하세요 (예: 김슈어)")
+#     if st.button("확인", key="login_confirm"):
+#         if name_in.strip():
+#             st.session_state.applicant_name = name_in.strip()
+#             st.success(f"안녕하세요, {st.session_state.applicant_name}님! 👋")
+#             st.rerun()
+#         else:
+#             st.warning("이름을 입력하세요.")
+#     st.stop()
 
-APPLICANT_NAME = st.session_state.applicant_name
+# APPLICANT_NAME = st.session_state.applicant_name
 
-st.title("출장비용지급품의 보조 도구 (MVP)")
+# [E] 초기 사용자이름 입력 페이지===========
+st.title("법인카드 사용 내역 자동점검 및 레포팅 시스템")
 
+
+### 🅱️메인화면 사이드 바-----
 with st.sidebar:
-    st.markdown(f"**신청자:** {APPLICANT_NAME}")
+    #st.markdown(f"**신청자:** {APPLICANT_NAME}")      #초기 사용자이름 입력
     st.caption("※ CSV는 UTF-8 권장 / 컬럼명 표준은 README 참고")
 
-tab1, tab2, tab3 = st.tabs([
-    "① 데이터 업로드·자동기입·검증",
+
+
+### 🦖메인화면 탭-----
+tab1, tab2, tab3, tab4 = st.tabs([
+    "① 근태 스크린샷 → 상세내용/공급가액 자동기입",
     "② 경로검색(네이버지도)",
-    "③ 카드/결의 대사 결과"       # ← 추가
+    "③ 카드/결의 대사 결과",
+    "④ 사용기록 대시보드",
 ])
 
-# ---------------- Tab1 ----------------
-with tab1:
-    st.subheader("1) CSV 업로드")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        f_card = st.file_uploader("카드내역 CSV(법인카드 포함)", type=["csv"], key="card")
-    with c2:
-        f_manual = st.file_uploader("수기 입력 CSV(비법인/개인카드 등)", type=["csv"], key="manual")
-    with c3:
-        f_titles = st.file_uploader("기존 국내출장 보고서 제목 CSV(title 한 컬럼)", type=["csv"], key="titles")
 
-    if st.button("자동기입 실행", type="primary"):
-        if not f_card and not f_manual:
-            st.warning("최소 한 개의 거래 CSV가 필요합니다.")
+# === 근태 스크린샷 → 지출결의서 HTML 자동반영 ===
+st.divider()
+st.subheader("1) 근태 스크린샷 → 상세내용/공급가액 자동기입 (HTML에 반영)")
+
+# 기본 HTML 양식 설정 (세션에 저장)
+with st.expander("📄 기본 HTML 양식 설정 (최초 1회)", expanded=("base_html" not in st.session_state)):
+    base_html_upload = st.file_uploader("기본 지출결의서 HTML 템플릿 업로드", type=["html","htm"], key="base_html_upload")
+    if base_html_upload:
+        st.session_state.base_html = base_html_upload.read()
+        st.success(f"✅ 기본 양식 저장 완료 ({len(st.session_state.base_html)} bytes)")
+
+    if "base_html" in st.session_state:
+        st.info(f"현재 기본 양식: {len(st.session_state.base_html)} bytes 저장됨")
+        if st.button("기본 양식 초기화", key="reset_base_html"):
+            del st.session_state.base_html
+            st.rerun()
+
+# 근태 스크린샷 업로드
+att_img = st.file_uploader("근태현황 스크린샷 업로드 (PNG/JPG)", type=["png","jpg","jpeg"], key="att_img")
+
+debug_view = st.checkbox("🔎 디버그 보기(ROI/색마스크/라인)", value=True)
+
+if st.button("이미지 인식 → HTML 자동반영", key="run_img2html", type="primary"):
+    if not att_img:
+        st.warning("근태 이미지를 업로드하세요.")
+        st.stop()
+
+    if "base_html" not in st.session_state:
+        st.error("먼저 기본 HTML 양식을 설정해주세요.")
+        st.stop()
+
+    try:
+        # 1 이미지 OCR로 시간 추출
+        img_bytes = att_img.read()
+        if debug_view:
+            times, dbg = extract_times_from_image(img_bytes, return_debug=True)
+            st.success(f"인식 결과 → 총:{times['total_hm']} / 선택:{times['select_hm']} / 초과:{times['extend_hm']}")
+
+            c1, c2 = st.columns(2)
+
+            # 편의 헬퍼 (버전 호환)
+            def show(img, caption):
+                st.image(img, caption=caption, use_column_width=True)
+
+            with c1:
+                show(dbg["orig"], "원본")
+                # 마스크는 0~255 그레이스케일(np.uint8)
+                show(dbg["green_mask"], "녹색 마스크(선택근무 점)")
+
+            with c2:
+                show(dbg["overlay"], "오버레이(ROI/라인/읽은박스)")
+                show(dbg["red_mask"], "빨강 마스크(초과근무 점)")
         else:
-            dfs = []
-            if f_card:
-                dfc = pd.read_csv(f_card)
-                missing_cols = set(CARD_COLS) - set(dfc.columns)
-                if missing_cols:
-                    st.error(f"카드 CSV 컬럼 부족: {missing_cols}")
-                    st.stop()
-                dfc = auto_fill_card_rows(dfc)
-                dfs.append(dfc)
+            times = extract_times_from_image(img_bytes)
 
-            if f_manual:
-                dfm = pd.read_csv(f_manual)
-                missing_cols = set(MANUAL_COLS) - set(dfm.columns)
-                if missing_cols:
-                    st.error(f"수기 CSV 컬럼 부족: {missing_cols}")
-                    st.stop()
-                dfm = auto_defaults_for_non_corp(dfm)
-                dfs.append(dfm)
+        # 2 HTML에 반영 (상세내용·공급가액)
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp_in:
+            tmp_in.write(st.session_state.base_html)  # ← 여기!
+            tmp_in.flush()
+            in_path = tmp_in.name
 
-            df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-            # 제목 자동 생성
-            if not df_all.empty:
-                month = str(df_all['report_month'].iloc[0])
-                auto_t = auto_title(month, APPLICANT_NAME)
-                st.success(f"제목 자동 생성: **{auto_t}**")
+        out_fd, out_path = tempfile.mkstemp(suffix=".html")
+        os.close(out_fd)
 
-            # 보고서 누락 체크
-            if f_titles and not df_all.empty:
-                titles_df = pd.read_csv(f_titles)
-                if 'title' not in titles_df.columns: st.error("제목 CSV에는 'title' 컬럼이 필요합니다."); st.stop()
-                df_all = mark_missing_reports(df_all, titles_df)
-                miss_n = int(df_all['missing_report'].sum())
-                if miss_n > 0:
-                    st.toast("해당출장지출에 대한 출장보고서가 누락되었습니다!", icon="⚠️")
-                    st.info(f"보고서 누락 건수: {miss_n}건 (표의 'missing_report' 열 확인)")
-            st.divider()
-            st.subheader("자동기입 결과 미리보기")
-            st.dataframe(df_all, use_container_width=True, height=480)
-            st.download_button("CSV 다운로드", df_all.to_csv(index=False).encode("utf-8-sig"),
-                               file_name="auto_filled_expenses.csv")
+        result = process_html(in_path, out_path, override=times)
+        st.json(result)  # {'총근무','선택근무','초과근무','공급가액','상세내용'}
 
-# ---------------- Tab2 ----------------
+        # 3 수정된 HTML 다운로드 제공
+        with open(out_path, "rb") as f:
+            updated = f.read()
+        st.download_button(
+            "수정된 지출결의서 HTML 다운로드",
+            data=updated, file_name="updated_expenditure.html", mime="text/html"
+        )
+
+        with st.expander("수정된 HTML 일부 미리보기"):
+            st.code(updated.decode("utf-8", errors="ignore")[:4000], language="html")
+
+    except Exception as e:
+        st.error(f"자동 반영 중 오류: {e}")
+    finally:
+        try: os.remove(in_path)
+        except: pass
+        try: os.remove(out_path)
+        except: pass
+
+
+
+
+
+
+
+
+# --Tab2 2.경로검색(네이버지도) ----------------
 with tab2:
     st.subheader("경로 검색(네이버 지도)")
     if not NAVER_CLIENT_ID:
@@ -129,6 +180,11 @@ with tab2:
                 else:
                     st.info("이미지 생성은 키가 필요하거나 일시적 오류일 수 있어요.")
 
+
+
+
+
+# --Tab3. 카드 vs 결의서 대사 결과) ----------------
 with tab3:
     st.subheader("카드 vs 결의서 대사 결과")
 
@@ -216,3 +272,64 @@ with st.expander("FAQ / 규정 검색 (RAG)"):
             a, refs = rag_answer(q)
             st.markdown(a)
             if refs: st.caption("참고 소스: " + ", ".join(m.get("path","") for m in refs if isinstance(m,dict)))
+
+
+
+# ---------------- Tab1: 지출결의서 HTML 자동기입 ----------------
+st.divider()
+st.subheader("2) 지출결의서 HTML 자동기입 (상세내용·공급가액)")
+
+html_file = st.file_uploader("지출결의서 HTML 업로드 (export된 .html)", type=["html", "htm"], key="expense_html2")
+
+col_run1, col_run2 = st.columns([1, 3])
+with col_run1:
+    run_html_btn = st.button("HTML 자동기입 실행", key="run_autofill_html", type="primary")
+
+if run_html_btn:
+    if not html_file:
+        st.warning("지출결의서 HTML 파일을 업로드하세요.")
+        st.stop()
+
+    # 업로드 파일을 임시 경로에 저장 후 처리
+    import tempfile, os
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp_in:
+        tmp_in.write(html_file.read())
+        tmp_in.flush()
+        in_path = tmp_in.name
+
+    out_fd, out_path = tempfile.mkstemp(suffix=".html")
+    os.close(out_fd)
+
+    try:
+        result = process_html(in_path, out_path)  # ✅ 상세내용/공급가액 자동 반영
+        st.success("HTML 자동기입이 완료되었습니다.")
+        st.json(result)  # {'총근무', '선택근무', '초과근무', '공급가액', '상세내용'}
+
+        # 수정된 HTML 읽어서 다운로드 버튼 제공
+        with open(out_path, "rb") as f:
+            updated_bytes = f.read()
+
+        st.download_button(
+            "수정된 지출결의서 HTML 다운로드",
+            data=updated_bytes,
+            file_name="updated_expenditure.html",
+            mime="text/html",
+        )
+
+        # 간단 미리보기(선택)
+        with st.expander("수정된 HTML 텍스트 미리보기"):
+            st.code(updated_bytes.decode("utf-8", errors="ignore")[:5000], language="html")
+
+    except Exception as e:
+        st.error(f"자동기입 중 오류가 발생했습니다: {e}")
+    finally:
+        # 임시파일 정리
+        try:
+            os.remove(in_path)
+        except Exception:
+            pass
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
