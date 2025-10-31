@@ -139,17 +139,6 @@ def make_highlight_func(red_inx_arr, yellow_idx_arr, blue_idx_arr):
             return [""] * len(row)
     return highlight_over_limit
 
-def highlight_rows_by_ids(df, id_list):
-    df['승인번호'] = df['승인번호'].astype(str)
-    id_list = [str(x) for x in id_list]
-
-    def highlight_row(row):
-        if row['승인번호'] in id_list:
-            return ['background-color: yellow'] * len(row)
-        else:
-            return [''] * len(row)
-
-    return df.style.apply(highlight_row, axis=1)
 
 st.set_page_config(page_title="RAG FAQ 시스템", layout="wide")
 st.title("📚 \"알려줘\"")
@@ -197,15 +186,17 @@ with tab2:
     
     # 화면을 좌우로 분할
     left_col, right_col = st.columns(2)
+    #left_placeholder = left_col.empty()
     
     with left_col:
         st.markdown("#### 📄 법인카드 승인내역")
+
         approval_file = st.file_uploader(
             "승인내역 파일 업로드 (xlsx/xls/csv)", 
             type=['xlsx', 'xls', 'csv'],
             key="approval"
         )
-        
+        left_placeholder = st.empty()
         if approval_file:
             # 파일 읽기
             try:
@@ -216,22 +207,28 @@ with tab2:
                 
                 # 매칭된 행 하이라이트 함수
                 def highlight_matched_approval(row):
-                    if row.name in st.session_state.matched_indices:
+                    #if row.name in st.session_state.matched_indices:
+                    if str(row['승인번호']) in st.session_state.get("matched_ids_set", set()):
                         return ['background-color: #cccccc'] * len(row)
                     return [''] * len(row)
                 
                 # 데이터 표시
                 if st.session_state.matched_indices:
-                    st.dataframe(
-                        st.session_state.approval_df.style.apply(
-                            highlight_matched_approval, 
-                            axis=1
-                        ),
-                        use_container_width=True, 
-                        height=400
+                    #st.dataframe(
+                    #    st.session_state.approval_df.style.apply(highlight_matched_approval, axis=1),
+                    #    use_container_width=True, height=400
+                    #)
+
+                    # (교체)
+                    left_placeholder.dataframe(
+                        st.session_state.approval_df.style.apply(highlight_matched_approval, axis=1),
+                        use_container_width=True, height=400
                     )
+
                 else:
-                    st.dataframe(st.session_state.approval_df, use_container_width=True, height=400)
+                    #st.dataframe(st.session_state.approval_df, use_container_width=True, height=400)
+                    # (교체)
+                    left_placeholder.dataframe(st.session_state.approval_df, use_container_width=True, height=400)
                     
             except Exception as e:
                 st.error(f"파일 읽기 오류: {str(e)}")
@@ -268,9 +265,29 @@ with tab2:
                                 limits_df
                             )
                             
+                            # ✅ 추가: 승인번호 set 생성 (왼쪽 표 색칠 및 대조 기준)
+                            matched_ids = set(
+                                st.session_state.approval_df.iloc[matched_approval_indices]['승인번호'].astype(str)
+                            )
+                            st.session_state.matched_ids_set = matched_ids  # ← 이제 NameError 안 남
+                            
+                            #추가
+                                                        # 매칭 결과 저장
+                            st.session_state.expense_df = result_df
+                            st.session_state.matched_indices = matched_approval_indices
+                            
+                            def highlight_matched_approval(row):
+                                if str(row['승인번호']) in st.session_state.get("matched_ids_set", set()):
+                                    return ['background-color: #cccccc'] * len(row)
+                                return [''] * len(row)
+                            
+                            left_placeholder.dataframe(
+                                st.session_state.approval_df.style.apply(highlight_matched_approval, axis=1),
+                                use_container_width=True, height=400
+                            )
+
                             # 매칭 결과 저장
                             st.session_state.expense_df = result_df
-                            st.session_state.matched_ids_set = matched_ids
                             st.session_state.matched_indices = matched_approval_indices
 
                             if test_all_data(st.session_state.expense_df) == 1:
@@ -322,17 +339,15 @@ with tab2:
                             print(f"❌ 한도금액 매칭 오류: {e}")
 
 
-                            # 매칭 통계 표시
-                            total_expense = len(result_df)
-                            matched_count = len(matched_approval_indices)
-                            limit_count = sum(1 for val in result_df['한도금액'] if val != '')
-                            
-                            st.success(f"""✅ 매칭 완료!
-                            - 승인번호 매칭: {matched_count}/{total_expense}건
-                            - 한도금액 설정: {limit_count}/{total_expense}건""")
-                            
-                            # 화면 갱신
-                            st.rerun()
+                        # 매칭 통계 표시
+                        total_expense = len(result_df)
+                        matched_count = len(matched_approval_indices)
+                        limit_count = sum(1 for val in result_df['한도금액'] if val != '')
+                        
+                        st.success(f"""✅ 매칭 완료!
+                        - 승인번호 매칭: {matched_count}/{total_expense}건
+                        - 한도금액 설정: {limit_count}/{total_expense}건""")
+
                     else:
                         st.error("⚠️ 먼저 승인내역 파일을 업로드해주세요.")
                 else:
