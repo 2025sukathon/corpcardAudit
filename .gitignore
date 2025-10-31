@@ -1,21 +1,29 @@
-# venv / caches
+# Python venv
 .venv/
+.venv312/
 venv/
-__pycache__/
-*.pyc
-
-# OS / IDE
-.DS_Store
-.idea/
-.vscode/
-
-# local data
-.env
-*.db
+ENV/
+env/
+# local test data
+data/samples/
 data/vectorstore/
-data/*.csv
-data/*.xlsx
-
-# build artifacts
-dist/
+# local python envs
+.venv*/
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+# VSCode / PyCharm settings
+.vscode/
+.idea/
+# OS files
+.DS_Store
+Thumbs.db
+# Environment files
+.env
+.env.*
+# Build outputs
 build/
+dist/
+*.egg-info/
+requirements-py313.txt

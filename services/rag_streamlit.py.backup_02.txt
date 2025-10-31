@@ -1,0 +1,287 @@
+import streamlit as st
+import os, glob, re
+import pandas as pd
+from datetime import datetime, timedelta
+from chromadb import PersistentClient
+from services.rag import _embedding_function, _read_qa_csv, _read_qa_md, FAQDIR, DBDIR, _OPENAI_CLIENT
+
+# ---------------- 기본 설정 ----------------
+st.set_page_config(page_title="RAG FAQ 시스템", layout="wide")
+st.title("📚 RAG 기반 FAQ 질의 시스템")
+
+# ---------------- 숨김/정정 파일 로더 ----------------
+def _read_hidden_data():
+    """hidden/ 및 correction/ 폴더 내용 통합"""
+    hidden_dir = os.path.join(FAQDIR, "hidden")
+    correction_dir = os.path.join(FAQDIR, "correction")
+    hidden_txt, correction_txt = [], []
+
+    for folder, acc in [(hidden_dir, hidden_txt), (correction_dir, correction_txt)]:
+        if not os.path.exists(folder):
+            continue
+        for f in glob.glob(os.path.join(folder, "*.txt")) + glob.glob(os.path.join(folder, "*.csv")):
+            try:
+                acc.append(open(f, encoding="utf-8").read())
+            except Exception as e:
+                st.warning(f"⚠ {folder} 파일 읽기 오류: {e}")
+
+    hidden_rules = "\n".join(hidden_txt)
+    correction_rules = "\n".join(correction_txt)
+    return hidden_rules, correction_rules
+
+
+# ---------------- 조직도 분석 ----------------
+def _count_members_from_org(org_path: str, leader_name: str) -> tuple[int | None, str | None]:
+    """CSV 조직도에서 팀장 이름으로 팀원 수와 팀명 반환"""
+    try:
+        df = pd.read_csv(org_path)
+        if "팀장" not in df.columns:
+            return None, None
+
+        row = df[df["팀장"] == leader_name]
+        if row.empty:
+            return None, None
+
+        if "팀원수" in df.columns:
+            team_count = int(row.iloc[0]["팀원수"])
+        else:
+            members_str = str(row.iloc[0].get("팀원", "")).strip()
+            team_count = len([m for m in members_str.split(",") if m.strip()])
+
+        team_name = row.iloc[0].get("팀명", None)
+        return team_count, team_name
+
+    except Exception as e:
+        print(f"❌ 조직도 CSV 파싱 오류: {e}")
+        return None, None
+
+
+# ---------------- 색인 빌드 ----------------
+def safe_build_index():
+    """모든 문서 형식(pdf, txt, csv, xlsx, md)을 색인"""
+    os.makedirs(DBDIR, exist_ok=True)
+    cli = PersistentClient(path=DBDIR)
+
+    try:
+        cli.delete_collection("faqs_openai")
+        st.success("✅ 기존 컬렉션 삭제 완료")
+    except Exception:
+        st.info("ℹ️ 기존 컬렉션 없음, 새로 생성합니다.")
+
+    col = cli.get_or_create_collection("faqs_openai", embedding_function=_embedding_function())
+
+    ids, docs, metas = [], [], []
+    exts = [".md", ".txt", ".pdf", ".csv", ".xlsx"]
+    files = []
+    for ext in exts:
+        files.extend(glob.glob(os.path.join(FAQDIR, f"*{ext}")))
+
+    MAX_CHARS = 6000
+
+    for f in files:
+        ext = os.path.splitext(f)[1].lower()
+        text = ""
+
+        try:
+            if ext in [".md", ".txt"]:
+                with open(f, "r", encoding="utf-8") as fp:
+                    text = fp.read()
+
+            elif ext == ".pdf":
+                from pypdf import PdfReader
+                reader = PdfReader(f)
+                text = "\n".join([p.extract_text() or "" for p in reader.pages])
+
+            elif ext == ".csv":
+                df = pd.read_csv(f, encoding="utf-8")
+                text = "\n".join([
+                    ", ".join([f"{col}: {str(val)}" for col, val in row.items()])
+                    for _, row in df.iterrows()
+                ])
+
+            elif ext == ".xlsx":
+                from openpyxl import load_workbook
+                wb = load_workbook(f, data_only=True)
+                for sheet in wb.sheetnames:
+                    ws = wb[sheet]
+                    for row in ws.iter_rows(values_only=True):
+                        line = ", ".join([str(v) for v in row if v is not None])
+                        text += line + "\n"
+
+        except Exception as e:
+            st.warning(f"⚠️ {os.path.basename(f)} 읽기 오류: {e}")
+            continue
+
+        if text.strip():
+            for i in range(0, len(text), MAX_CHARS):
+                chunk = text[i:i + MAX_CHARS]
+                ids.append(f"{os.path.basename(f)}_part{i//MAX_CHARS+1}")
+                docs.append(chunk)
+                metas.append({"path": f, "ext": ext, "part": i//MAX_CHARS+1})
+
+    if ids:
+        try:
+            col.upsert(ids=ids, documents=docs, metadatas=metas)
+            st.success(f"✅ {len(ids)}개 문서 색인 완료")
+        except Exception as e:
+            st.error(f"❌ 업서트 실패: {e}")
+
+    qa_files = glob.glob(f"{FAQDIR}/*.csv") + glob.glob(f"{FAQDIR}/faq_qa.md") + glob.glob(f"{FAQDIR}/*_qa.md")
+    q_ids, q_docs, q_metas = [], [], []
+    for f in qa_files:
+        pairs = _read_qa_csv(f) if f.endswith(".csv") else _read_qa_md(f)
+        for idx, (q, a) in enumerate(pairs):
+            q_ids.append(f"{os.path.basename(f)}::Q{idx+1}")
+            q_docs.append(f"[Q] {q}\n[A] {a}")
+            q_metas.append({"path": f, "type": "qa"})
+    if q_ids:
+        col.upsert(ids=q_ids, documents=q_docs, metadatas=q_metas)
+        st.success(f"✅ {len(q_ids)}개 Q&A 색인 완료")
+
+
+# ---------------- RAG 질의 ----------------
+def safe_rag_query(question: str, k: int = 3, show_sources: bool = False):
+    cli = PersistentClient(path=DBDIR)
+    col = cli.get_or_create_collection("faqs_openai", embedding_function=_embedding_function())
+    r = col.query(query_texts=[question], n_results=k)
+
+    ctx = "\n\n".join(r["documents"][0]) if r and r.get("documents") else ""
+    metas = r["metadatas"][0] if r and r.get("metadatas") else []
+
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d (%A)")
+    week_start = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+    week_end = (now + timedelta(days=6 - now.weekday())).strftime("%Y-%m-%d")
+    month_str = now.strftime("%Y-%m")
+
+    hidden_context, correction_rules = _read_hidden_data()
+
+    designated_amounts = {}
+    for line in hidden_context.splitlines():
+        m = re.match(r"(\S+)\s*(\d+(?:,\d+)*)원", line)
+        if m:
+            rank, amt = m.groups()
+            designated_amounts[rank] = int(amt.replace(",", ""))
+
+    match_name_rank = re.search(r"([가-힣A-Za-z]+)\s*(팀장|부장|임원|차장|과장|대리|사원)", question)
+    user_name, user_rank = (match_name_rank.groups() if match_name_rank else (None, None))
+
+    org_path = os.path.join(FAQDIR, "org_info.csv")
+    member_count, team_name = _count_members_from_org(org_path, user_name) if user_name else (None, None)
+
+    team_info_text, auto_calc_text = "", ""
+    if member_count and team_name:
+        team_info_text = f"{team_name} ({user_rank} {user_name})의 팀원 수는 {member_count}명입니다."
+    if "업무추진비" in question and user_rank in designated_amounts:
+        base = designated_amounts[user_rank]
+        if member_count:
+            total = base * member_count
+            auto_calc_text = f"💰 자동 계산: {user_rank} {user_name} - 팀원 {member_count}명 × {base:,}원 = {total:,}원"
+        else:
+            auto_calc_text = f"💰 자동 계산: {user_rank} 기준 1인당 {base:,}원"
+
+    system_prompt = (
+        f"오늘은 {today_str}이며, 이번 주는 {week_start}~{week_end}, 이번 달은 {month_str}월입니다.\n"
+        "다음 정보를 참고하여 간결하고 정확하게 한국어로 답변하세요.\n"
+        "hidden 폴더의 내용은 내부 규칙 참고용이며, 답변에 직접 노출하지 마세요.\n\n"
+        f"[숨김 규칙]\n{hidden_context}\n"
+        f"[정정 자료]\n{correction_rules}\n"
+        f"[조직도 정보]\n{team_info_text}\n"
+        f"[자동 계산]\n{auto_calc_text}\n"
+    )
+
+    answer = ""
+    if _OPENAI_CLIENT and ctx.strip():
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"[컨텍스트]\n{ctx}\n\n[질문]\n{question}"},
+        ]
+        try:
+            resp = _OPENAI_CLIENT.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=msgs,
+                temperature=0.1,
+            )
+            answer = resp.choices[0].message.content
+        except Exception as e:
+            answer = f"❌ LLM 오류: {e}"
+    else:
+        answer = f"(OPENAI_API_KEY 없음 또는 컨텍스트 부족)\n\n{ctx[:800]}"
+
+    if show_sources and metas:
+        srcs = [f"📄 `{os.path.basename(m.get('path',''))}`" for m in metas if m.get("path")]
+        if srcs:
+            answer += "\n\n---\n**📂 참고 문서:**\n" + "\n".join(srcs)
+    return answer
+
+
+# ---------------- Streamlit UI ----------------
+tab1, tab2 = st.tabs(["💬 일반 사용자", "🛠 관리자"])
+
+# ----------- 일반 사용자 탭 -----------
+with tab1:
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    user_input = st.text_input("질문을 입력하세요:")
+    if user_input:
+        answer = safe_rag_query(user_input)
+        st.session_state.history.append((user_input, answer))
+        st.markdown("### 🤖 답변")
+        st.write(answer)
+        st.write("---")
+
+    if st.session_state.history:
+        st.markdown("### 📜 이전 대화 기록")
+        for idx, (q, a) in enumerate(st.session_state.history, 1):
+            with st.expander(f"Q{idx}: {q}", expanded=False):
+                st.markdown(f"**A:** {a}")
+
+# ----------- 관리자 탭 -----------
+with tab2:
+    with st.expander("📂 정정 자료 추가 (correction/)", expanded=False):
+        st.info("정정자료 폴더에 txt 또는 csv 파일을 추가하면 RAG 색인 시 반영됩니다.")
+    with st.expander("🔒 히든 룰 추가 (hidden/)", expanded=False):
+        st.info("RAG은 / rag는 으로 시작하는 문장은 답변에 영향을 주지만 직접 노출되지 않습니다.")
+
+    if st.button("🧱 색인 재빌드"):
+        safe_build_index()
+        st.success("색인 재빌드 완료 ✅")
+
+    st.divider()
+    st.subheader("🔍 관리자용 테스트 질의")
+    admin_question = st.text_input("테스트할 질문을 입력하세요 (Enter로 실행):", key="admin_question")
+    if admin_question.strip():
+        show_src = st.checkbox("참고 문서 경로 표시", value=True, key="show_sources_admin")
+        answer = safe_rag_query(admin_question, show_sources=show_src)
+        st.markdown("### 🧠 RAG 응답 미리보기")
+        st.write(answer)
+    st.caption(f"🕒 서버 기준 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    st.divider()
+    st.subheader("🧭 조직도 미리보기")
+
+    org_path = os.path.join(FAQDIR, "org_info.csv")
+    if os.path.exists(org_path):
+        try:
+            df = pd.read_csv(org_path)
+            search_term = st.text_input("🔍 팀명 또는 팀장으로 검색:", key="org_search").strip()
+            if search_term:
+                filtered_df = df[
+                    df["팀명"].astype(str).str.contains(search_term, case=False)
+                    | df["팀장"].astype(str).str.contains(search_term, case=False)
+                ]
+            else:
+                filtered_df = df
+            st.dataframe(filtered_df[["팀명", "팀장", "팀원수", "팀원"]], use_container_width=True, height=500)
+            if not filtered_df.empty:
+                team_choice = st.selectbox("팀 세부정보 보기:", filtered_df["팀명"])
+                team_row = filtered_df[filtered_df["팀명"] == team_choice].iloc[0]
+                with st.expander(f"📂 {team_row['팀명']} 상세 구성원 보기", expanded=False):
+                    st.write(f"**팀장:** {team_row['팀장']}")
+                    st.write(f"**팀원수:** {team_row['팀원수']}")
+                    st.write("**팀원:**")
+                    st.markdown("- " + "\n- ".join([m.strip() for m in str(team_row['팀원']).split(",") if m.strip()]))
+        except Exception as e:
+            st.error(f"❌ 조직도 CSV 파싱 오류: {e}")
+    else:
+        st.warning("⚠️ 조직도 파일(org_info.csv)이 data/vectorstore 폴더에 없습니다.")

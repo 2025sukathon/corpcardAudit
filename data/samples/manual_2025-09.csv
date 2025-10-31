@@ -1,0 +1,4 @@
+report_month,employee_name,date,approval_time,amount,merchant,proof_type,description,destination
+2025-09,김도희,2025-09-09,09:20:00,4500,,,,판교사무실
+2025-09,김도희,2025-09-17,13:00:44,12000,,,출장3_대전고객사_점심식대,대전고객사
+2025-09,김도희,2025-09-30,16:10:05,9000,카페-영수증분실,,,

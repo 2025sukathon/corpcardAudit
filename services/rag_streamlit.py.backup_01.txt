@@ -1,0 +1,89 @@
+# services/rag_streamlit.py
+import streamlit as st
+import os, glob
+from chromadb import PersistentClient
+from services.rag import _embedding_function, _read, _read_qa_csv, _read_qa_md, FAQDIR, DBDIR, _OPENAI_CLIENT
+
+# ---------------- 안전 빌드 ----------------
+def safe_build_index():
+    """기존 컬렉션 삭제 후 새 임베딩 함수로 안전하게 색인"""
+    os.makedirs(DBDIR, exist_ok=True)
+    cli = PersistentClient(path=DBDIR)
+
+    # 1) 기존 컬렉션 삭제
+    try:
+        cli.delete_collection("faqs_openai")
+        st.write("기존 컬렉션 삭제 완료")
+    except Exception:
+        st.write("삭제할 컬렉션 없음, 새로 생성")
+
+    # 2) 새 컬렉션 생성
+    col = cli.get_or_create_collection("faqs_openai", embedding_function=_embedding_function())
+
+    # 3) 문서 색인
+    ids, docs, metas = [], [], []
+    files = glob.glob(f"{FAQDIR}/*.md") + glob.glob(f"{FAQDIR}/*.txt") + glob.glob(f"{FAQDIR}/*.pdf")
+    for f in files:
+        txt = _read(f)
+        if not txt.strip():
+            continue
+        ids.append(os.path.basename(f))
+        docs.append(txt[:10000])
+        metas.append({"path": f})
+    if ids:
+        col.upsert(ids=ids, documents=docs, metadatas=metas)
+        st.write(f"{len(ids)}개 문서 색인 완료")
+
+    # 4) CSV/MD Q&A 색인
+    qa_files = glob.glob(f"{FAQDIR}/*.csv") + glob.glob(f"{FAQDIR}/faq_qa.md") + glob.glob(f"{FAQDIR}/*_qa.md")
+    q_ids, q_docs, q_metas = [], [], []
+    for f in qa_files:
+        pairs = _read_qa_csv(f) if f.endswith(".csv") else _read_qa_md(f)
+        for idx, (q, a) in enumerate(pairs):
+            q_ids.append(f"{os.path.basename(f)}::Q{idx+1}")
+            q_docs.append(f"[Q] {q}\n[A] {a}")
+            q_metas.append({"path": f, "type": "qa"})
+    if q_ids:
+        col.upsert(ids=q_ids, documents=q_docs, metadatas=q_metas)
+        st.write(f"{len(q_ids)}개 Q&A 색인 완료")
+
+    #cli.persist()
+    st.write("컬렉션 빌드 및 저장 완료")
+
+# ---------------- RAG 질의 ----------------
+def safe_rag_query(question: str, k: int = 3):
+    cli = PersistentClient(path=DBDIR)
+    col = cli.get_or_create_collection("faqs_openai", embedding_function=_embedding_function())
+    r = col.query(query_texts=[question], n_results=k)
+    ctx = "\n\n".join(r["documents"][0]) if r and r.get("documents") else ""
+
+    if _OPENAI_CLIENT is not None and ctx.strip():
+        msgs = [
+            {"role": "system", "content": "사내 규정/FAQ를 바탕으로 간결히 한국어로 답하세요. 인용은 따옴표로 표시."},
+            {"role": "user",   "content": f"[컨텍스트]\n{ctx}\n\n[질문]\n{question}"},
+        ]
+        try:
+            a = _OPENAI_CLIENT.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=msgs,
+                temperature=0.1,
+            )
+            return a.choices[0].message.content
+        except Exception as e:
+            st.write("❌ LLM 오류:", e)
+
+    return f"상위 스니펫:\n{ctx[:1200]}\n\n(OPENAI_API_KEY 없거나 오류 시 스니펫만 표시)"
+
+# ---------------- Streamlit UI ----------------
+st.title("📚 RAG FAQ 질의")
+
+user_input = st.text_input("질문을 입력하세요:")
+
+if st.button("관리자용: 색인 재빌드"):
+    safe_build_index()
+
+if user_input:
+    st.write(f"입력: {user_input}")
+    answer = safe_rag_query(user_input)
+    st.markdown("### RAG 답변")
+    st.write(answer)
