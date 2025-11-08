@@ -1,0 +1,194 @@
+# services/rag.py
+from __future__ import annotations
+import os, glob, csv
+from datetime import date
+from typing import Optional, List, Tuple, Dict
+
+import streamlit as st
+from dotenv import load_dotenv
+load_dotenv()
+
+import sys, httpx
+print("🧠 Python 실행 경로:", sys.executable)
+print("📦 httpx 버전:", httpx.__version__)
+
+from chromadb import PersistentClient
+from chromadb.utils import embedding_functions
+
+# ---------------- OpenAI 클라이언트 ----------------
+try:
+    from openai import OpenAI as _OpenAI
+except Exception:
+    _OpenAI = None
+
+def _make_openai_client() -> Optional["_OpenAI"]:
+    if not _OpenAI:
+        return None
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("❌ OPENAI_API_KEY가 .env에서 로드되지 않았습니다.")
+        return None
+    os.environ["OPENAI_API_KEY"] = api_key
+
+    http_proxy  = os.getenv("HTTP_PROXY")  or os.getenv("http_proxy")
+    https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+
+    client_args = {"timeout": 30.0}
+    if http_proxy or https_proxy:
+        proxies = {}
+        if http_proxy:
+            proxies["http://"] = http_proxy
+        if https_proxy:
+            proxies["https://"] = https_proxy
+        client_args["proxies"] = proxies
+
+    http_client = httpx.Client(**client_args) if client_args else None
+    return _OpenAI(http_client=http_client)
+
+_OPENAI_CLIENT = _make_openai_client()
+_OPENAI_EMB_MODEL = os.getenv("EMB_MODEL", "text-embedding-3-small")
+
+# ---------------- 임베딩 함수 (Chroma 0.4.16+ 호환) ----------------
+class OpenAIEmbedder:
+    """ChromaDB용 임베더: .name 속성과 __call__ 제공"""
+    def __init__(self, client, model_name: str):
+        self.client = client
+        self.model_name = model_name
+
+    @property
+    def name(self) -> str:
+        # ⚠️ 문자열 반환, 함수 호출 아님
+        return f"openai:{self.model_name}"
+
+    # ⚠️ Chroma 0.4.16+에서는 __call__이 정확히 input만 받아야 함
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        resp = self.client.embeddings.create(model=self.model_name, input=input)
+        return [d.embedding for d in resp.data]
+
+def _embedding_function():
+    if _OPENAI_CLIENT:
+        return OpenAIEmbedder(_OPENAI_CLIENT, _OPENAI_EMB_MODEL)
+    else:
+        return embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+
+# ---------------- 경로 설정 ----------------
+DBDIR  = "data/vectorstore/chroma"
+FAQDIR = "data/vectorstore"
+
+def _chroma_client():
+    os.makedirs(DBDIR, exist_ok=True)
+    return PersistentClient(path=DBDIR)
+
+# ---------------- 파일 리더 ----------------
+def _read(path: str) -> str:
+    if path.lower().endswith((".md", ".txt")):
+        return open(path, "r", encoding="utf-8").read()
+    try:
+        from pypdf import PdfReader
+        return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
+    except Exception:
+        return ""
+
+def _read_qa_csv(path: str) -> list[tuple[str, str]]:
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            q = (r.get("question") or "").strip()
+            a = (r.get("answer") or "").strip()
+            if q and a:
+                rows.append((q, a))
+    return rows
+
+def _read_qa_md(path: str) -> list[tuple[str, str]]:
+    txt = open(path, "r", encoding="utf-8").read()
+    pairs = []
+    for block in txt.split("### Q:")[1:]:
+        q, _, rest = block.partition("\n")
+        a_tag = "A:"
+        a = rest.split("\n", 1)[0] if a_tag not in rest else rest.split(a_tag, 1)[1].strip()
+        q, a = q.strip(), a.strip()
+        if q and a:
+            pairs.append((q, a))
+    return pairs
+
+# ---------------- 인덱스 빌드 ----------------
+def build_index() -> None:
+    os.makedirs(DBDIR, exist_ok=True)
+    cli = _chroma_client()
+    col = cli.get_or_create_collection("faqs_openai", embedding_function=_embedding_function())
+
+    # 1) PDF/MD/TXT 문서 색인
+    files = glob.glob(f"{FAQDIR}/*.md") + glob.glob(f"{FAQDIR}/*.txt") + glob.glob(f"{FAQDIR}/*.pdf")
+    ids, docs, metas = [], [], []
+    for f in files:
+        txt = _read(f)
+        if not txt.strip():
+            continue
+        ids.append(os.path.basename(f))
+        docs.append(txt[:10000])
+        metas.append({"path": f})
+    if ids:
+        col.upsert(ids=ids, documents=docs, metadatas=metas)
+
+    # 2) CSV/MD Q&A 색인
+    qa_files = glob.glob(f"{FAQDIR}/*.csv") + glob.glob(f"{FAQDIR}/faq_qa.md") + glob.glob(f"{FAQDIR}/*_qa.md")
+    q_ids, q_docs, q_metas = [], [], []
+    for f in qa_files:
+        pairs = _read_qa_csv(f) if f.endswith(".csv") else _read_qa_md(f)
+        for idx, (q, a) in enumerate(pairs):
+            q_ids.append(f"{os.path.basename(f)}::Q{idx+1}")
+            q_docs.append(f"[Q] {q}\n[A] {a}")
+            q_metas.append({"path": f, "type": "qa"})
+    if q_ids:
+        col.upsert(ids=q_ids, documents=q_docs, metadatas=q_metas)
+
+    cli.persist()
+
+# ---------------- 질의 응답 ----------------
+def rag_answer(question: str, k: int = 3) -> tuple[str, list[dict]]:
+    cli = PersistentClient(path=DBDIR)
+    col = cli.get_or_create_collection("faqs_openai", embedding_function=_embedding_function())
+    r = col.query(query_texts=[question], n_results=k)
+    ctx = "\n\n".join(r["documents"][0]) if r and r.get("documents") else ""
+
+    if _OPENAI_CLIENT is not None and ctx.strip():
+        msgs = [
+            {"role": "system", "content": "사내 규정/FAQ를 바탕으로 간결히 한국어로 답하세요. 인용은 따옴표로 표시."},
+            {"role": "user",   "content": f"[컨텍스트]\n{ctx}\n\n[질문]\n{question}"},
+        ]
+        try:
+            a = _OPENAI_CLIENT.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=msgs,
+                temperature=0.1,
+            )
+            return a.choices[0].message.content, (r["metadatas"][0] if r else [])
+        except Exception as e:
+            print("❌ LLM 오류:", e)
+
+    return (f"상위 스니펫:\n{ctx[:1200]}\n\n(OPENAI_API_KEY 없거나 오류 시 스니펫만 표시)",
+            r["metadatas"][0] if r else [])
+
+# ---------------- 기본 UI ----------------
+st.title("텍스트 입력 시 rag_answer() 수행")
+user_input = st.text_input("텍스트를 입력하세요:")
+
+if user_input:
+    st.write(f"사용자가 입력한 텍스트: {user_input}")
+
+    # PDF/MD/TXT 색인 후 존재 여부 확인
+    try:
+        build_index()
+        cli = PersistentClient(path=DBDIR)
+        col = cli.get_or_create_collection("faqs_openai")
+        st.write("true" if col.count() > 0 else "false")
+    except Exception as e:
+        st.write("false")
+        print("❌ 빌드 오류:", e)
+
+    # 질문에 대한 RAG 답변
+    answer, metadata = rag_answer(user_input)
+    st.markdown("### RAG 답변")
+    st.write(answer)

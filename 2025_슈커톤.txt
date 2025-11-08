@@ -1,0 +1,22 @@
+// python 3.12.12
+
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install chromadb==1.2.0
+streamlit run ./services/rag.py
+// email은 스킵
+
+deactivate
+
+
+
+python -m streamlit run services/rag_streamlit.py
+
+
+
+~/Desktop/programming/corpcardAudit/corpcardAudit/.venv/bin/python
+
+
+- 질답 기록 저장까지는 성공 (앱 닫으면 기록도 날아감)
+- 문제: 오늘 날짜(2025년 10월 29일)를 2023년 10월 5일로 알고 있음 
